@@ -1,0 +1,5 @@
+.env
+__pycache__/
+*.pyc
+.DS_Store
+C# UHF+2.4G Reader SrDemo2.0.3开发资料(20230216)/
