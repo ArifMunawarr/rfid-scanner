@@ -15,6 +15,7 @@ DEFAULT_PORT = int(os.getenv("RFID_PORT", "5000"))
 LISTEN_HOST = os.getenv("RFID_LISTEN_HOST", "0.0.0.0")
 TAG_MIN = os.getenv("RFID_TAG_MIN", "")
 TAG_MAX = os.getenv("RFID_TAG_MAX", "")
+TAG_ACTIVE_TIMEOUT = float(os.getenv("RFID_TAG_ACTIVE_TIMEOUT", "5"))
 
 # ============================================================
 # Build list of readers from .env
@@ -36,6 +37,10 @@ def _load_readers():
         host = os.getenv("RFID_READER_HOST", "172.15.5.222")
         readers.append({"id": 1, "host": host, "port": DEFAULT_PORT})
 
+    if MODE == "server":
+        endpoints = {(r["host"], r["port"]) for r in readers}
+        if len(endpoints) != len(readers):
+            raise ValueError("Setiap reader harus memiliki kombinasi IP dan port yang berbeda")
     return readers
 
 READERS = _load_readers()
@@ -75,6 +80,7 @@ is_scanning = True
 
 # Gabungan semua tags dari semua reader (untuk backward-compat di routes.py)
 tags = {}
+tags_lock = threading.RLock()
 
 # ============================================================
 # Helpers
@@ -93,10 +99,10 @@ def _get_status(reader_id):
     state = readers_state[reader_id]
     with state["status_lock"]:
         status = dict(state["connection_status"])
-    rtags = state["tags"]
-    active = sum(1 for t in rtags.values() if not t["remove"])
-    status["active_tags"] = active
-    status["total_tags"] = len(rtags)
+    with tags_lock:
+        rtags = state["tags"]
+        status["active_tags"] = sum(1 for t in rtags.values() if not t["remove"])
+        status["total_tags"] = len(rtags)
     return status
 
 
@@ -119,13 +125,19 @@ def get_connection_status():
 
 def _sync_global_tags():
     """Sinkronisasi tags gabungan dari semua reader ke dict `tags` global."""
-    global tags
-    merged = {}
-    for r in READERS:
-        for epc, tag in readers_state[r["id"]]["tags"].items():
-            key = f"{r['id']}:{epc}"
-            merged[key] = {**tag, "reader_id": r["id"]}
-    tags = merged
+    with tags_lock:
+        merged = {}
+        for r in READERS:
+            for epc, tag in readers_state[r["id"]]["tags"].items():
+                key = f"{r['id']}:{epc}"
+                merged[key] = {**tag, "reader_id": r["id"]}
+        tags.clear()
+        tags.update(merged)
+
+
+def get_tags():
+    with tags_lock:
+        return [dict(tag) for tag in tags.values()]
 
 # =========================
 # EXTRACT FRAME
@@ -186,6 +198,11 @@ def parse_frame(frame: bytes):
 # UPDATE TAG
 # =========================
 def _update_tag(reader_id, data):
+    with tags_lock:
+        _update_tag_locked(reader_id, data)
+
+
+def _update_tag_locked(reader_id, data):
     if not is_scanning:
         return
 
@@ -232,14 +249,15 @@ def _update_tag(reader_id, data):
 # =========================
 def cleanup_tags():
     while True:
-        if is_scanning:
-            now = time.time()
-            for r in READERS:
-                rtags = readers_state[r["id"]]["tags"]
-                for epc in list(rtags.keys()):
-                    if now - rtags[epc]["last_time"] > 5:
-                        rtags[epc]["remove"] = 1
-            _sync_global_tags()
+        with tags_lock:
+            if is_scanning:
+                now = time.time()
+                for r in READERS:
+                    rtags = readers_state[r["id"]]["tags"]
+                    for epc in list(rtags.keys()):
+                        if now - rtags[epc]["last_time"] > TAG_ACTIVE_TIMEOUT:
+                            rtags[epc]["remove"] = 1
+                _sync_global_tags()
         time.sleep(1)
 
 
@@ -250,7 +268,8 @@ def format_output(reader_id):
     if not is_scanning:
         return "[SCAN] Stopped"
 
-    rtags = readers_state[reader_id]["tags"]
+    with tags_lock:
+        rtags = {epc: dict(tag) for epc, tag in readers_state[reader_id]["tags"].items()}
     lines = []
     header = f"[Reader {reader_id}] num   id           devid            remove power battery        count  lasttime"
     lines.append(header)
@@ -301,7 +320,7 @@ def send_command(hex_cmd):
 # =========================
 # TCP WORKER per-reader (auto-reconnect)
 # =========================
-def _tcp_worker(reader_id, host, port):
+def _tcp_worker(reader_id, host, port, conn=None):
     state = readers_state[reader_id]
 
     while True:
@@ -315,6 +334,7 @@ def _tcp_worker(reader_id, host, port):
                 )
                 print(f"[TCP][Reader {reader_id}] Connecting to {host}:{port}...")
                 conn = socket.create_connection((host, port), timeout=5)
+                conn.settimeout(None)
                 state["conn"] = conn
                 _set_status(
                     reader_id,
@@ -328,30 +348,7 @@ def _tcp_worker(reader_id, host, port):
                 print(f"[TCP][Reader {reader_id}] Connected to {host}:{port}")
                 _send_command_to(reader_id, "BB 17 02 00 00 19 0D 0A")
             else:
-                srv = state.get("server")
-                if srv:
-                    try:
-                        srv.close()
-                    except:
-                        pass
-
-                srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                srv.bind((LISTEN_HOST, port))
-                srv.listen(1)
-                state["server"] = srv
-
-                _set_status(
-                    reader_id,
-                    connected=False,
-                    state="listening",
-                    message="Listening for RFID device",
-                    client_address=None,
-                )
-                print(f"[TCP][Reader {reader_id}] Listening on {port}... waiting for device")
-
-                conn, addr = srv.accept()
-                state["conn"] = conn
+                addr = conn.getpeername()
                 _set_status(
                     reader_id,
                     connected=True,
@@ -408,32 +405,91 @@ def _tcp_worker(reader_id, host, port):
 
         finally:
             state["running"] = False
-            conn = state.get("conn")
             if conn:
                 try:
                     conn.close()
                 except:
                     pass
+            with state["status_lock"]:
                 state["conn"] = None
-            _set_status(reader_id, connected=False, client_address=None)
+                state["connection_status"].update(connected=False, client_address=None)
 
+        if MODE == "server":
+            return
         print(f"[TCP][Reader {reader_id}] Reconnecting in 3 seconds...")
+        time.sleep(3)
+
+
+def _tcp_listener(port, readers):
+    while True:
+        try:
+            readers_by_host = {socket.gethostbyname(r["host"]): r for r in readers}
+            if len(readers_by_host) != len(readers):
+                raise OSError("IP reader pada port yang sama tidak boleh duplikat")
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
+                srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                srv.bind((LISTEN_HOST, port))
+                srv.listen(max(1, len(readers)))
+                for r in readers:
+                    state = readers_state[r["id"]]
+                    state["server"] = srv
+                    if state["conn"] is None:
+                        _set_status(
+                            r["id"], connected=False, state="listening",
+                            message="Listening for RFID device", client_address=None,
+                            last_error=None,
+                        )
+                print(f"[TCP] Listening on {LISTEN_HOST}:{port} for {len(readers)} reader(s)")
+                while True:
+                    conn, addr = srv.accept()
+                    reader = readers_by_host.get(addr[0])
+                    if reader is None:
+                        print(f"[TCP] Rejected unconfigured reader from {addr}")
+                        conn.close()
+                        continue
+                    state = readers_state[reader["id"]]
+                    with state["status_lock"]:
+                        if state["conn"] is not None:
+                            conn.close()
+                            continue
+                        state["conn"] = conn
+                    threading.Thread(
+                        target=_tcp_worker,
+                        args=(reader["id"], reader["host"], port, conn),
+                        daemon=True,
+                        name=f"rfid-reader-{reader['id']}",
+                    ).start()
+        except OSError as exc:
+            for r in readers:
+                if readers_state[r["id"]]["conn"] is None:
+                    _set_status(
+                        r["id"], connected=False, state="error",
+                        message="TCP listener error", last_error=str(exc),
+                    )
+            print(f"[TCP] Listener {port} error: {exc}")
+        finally:
+            for r in readers:
+                readers_state[r["id"]]["server"] = None
         time.sleep(3)
 
 
 def tcp_server():
     """Jalankan semua TCP worker secara paralel (1 thread per reader)."""
     threads = []
-    for r in READERS:
-        t = threading.Thread(
-            target=_tcp_worker,
-            args=(r["id"], r["host"], r["port"]),
-            daemon=True,
-            name=f"rfid-reader-{r['id']}",
-        )
+    if MODE == "server":
+        groups = {}
+        for r in READERS:
+            groups.setdefault(r["port"], []).append(r)
+        workers = [(_tcp_listener, (port, readers), f"rfid-listener-{port}")
+                   for port, readers in groups.items()]
+    else:
+        workers = [(_tcp_worker, (r["id"], r["host"], r["port"]), f"rfid-reader-{r['id']}")
+                   for r in READERS]
+    for target, args, name in workers:
+        t = threading.Thread(target=target, args=args, daemon=True, name=name)
         t.start()
         threads.append(t)
-        print(f"[RFID] Reader {r['id']} thread started: {r['host']}:{r['port']}")
+        print(f"[RFID] {name} thread started")
     # Tunggu semua thread (tidak akan selesai karena infinite loop)
     for t in threads:
         t.join()
@@ -443,15 +499,17 @@ def tcp_server():
 # =========================
 def start_scan():
     global is_scanning
-    is_scanning = True
+    with tags_lock:
+        is_scanning = True
     print("[SCAN] Start scan initiated (all readers)")
     return send_command("BB 17 02 00 00 19 0D 0A")
 
 def stop_scan():
-    global is_scanning, tags
-    is_scanning = False
-    for r in READERS:
-        readers_state[r["id"]]["tags"].clear()
-    tags.clear()
+    global is_scanning
+    with tags_lock:
+        is_scanning = False
+        for r in READERS:
+            readers_state[r["id"]]["tags"].clear()
+        tags.clear()
     print("[SCAN] Stop scan initiated (tags cleared on all readers)")
     return send_command("BB 18 00 18 0D 0A")

@@ -1,7 +1,7 @@
 import json
 from datetime import datetime
 from fastapi import APIRouter
-from rfid import tags, send_command, get_connection_status, start_scan, stop_scan
+from rfid import get_tags, send_command, get_connection_status, start_scan, stop_scan
 
 router = APIRouter()
 
@@ -9,7 +9,7 @@ router = APIRouter()
 def build_tags_data():
     result = []
     i = 1
-    for tag in tags.values():
+    for tag in get_tags():
         if tag["remove"]:
             continue
         dt = datetime.fromtimestamp(tag["last_time"])
@@ -17,6 +17,7 @@ def build_tags_data():
         result.append({
             "num": i,
             "id": tag["id"],
+            "reader_id": tag["reader_id"],
             "device_id": tag["device_id"],
             "epc": tag.get("epc"),
             "tid": tag.get("tid"),
